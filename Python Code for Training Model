@@ -1,4 +1,4 @@
-Appendix B: Python Code for Training Model
+Python Code for Training Model
 
 # train_model.py
 import os, subprocess, sys, shutil, tempfile
