@@ -1,0 +1,701 @@
+Python Code for Live Annotation Tool
+
+#LiveAnnotationTool 
+import sys
+import os
+import numpy as np
+import pandas as pd
+import ffmpeg
+from pydub import AudioSegment
+import json
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QComboBox, QWidget, QMessageBox, QStyle, QInputDialog,
+    QListWidget, QListWidgetItem, QGridLayout, QLineEdit, QDialog, QToolBar,
+    QMenu
+)
+from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtCore import Qt, QTimer, QSize, QUrl
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+import pyqtgraph as pg
+import io
+from pathlib import Path
+class LiveAnnotationTool(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        # Check for required dependencies
+        try:
+            import numpy, pandas, ffmpeg, pydub, pyqtgraph
+        except ImportError as e:
+            QMessageBox.critical(None, "Dependency Error", f"Missing library: {str(e)}. Please install all dependencies.")
+            sys.exit(1)
+        self.setWindowTitle("Live Annotation Tool")
+        self.setGeometry(100, 100, 1200, 700)
+        self.folder = None
+        self.trimmed_folder = None
+        self.file_list = []
+        self.current_file = None
+        self.start_time = None
+        self.end_time = None
+        self.annotations = []
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.timer = QTimer(self)
+        self.rotation_angle = 0
+        self.audio_waveform = None
+        self.video_duration = 0
+        self.global_config_file = "speech_config.json"
+        self.user_config_dir = Path.home() / "Documents" / "LiveAnnotationTool"
+        self.user_config_file = self.user_config_dir / "user_config.json"
+        self.speech_types = self.load_speech_types()
+        self.user_config_dir.mkdir(parents=True, exist_ok=True)
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QHBoxLayout(self.central_widget)
+        self.init_ui()
+        self.load_default_folder()
+        self.load_all_annotations()
+    def init_ui(self):
+        # --- Menu Bar ---
+        self.setup_menu_bar()
+        # --- Toolbar ---
+        self.toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+        self.setup_toolbar()
+        # --- Left Layout (Source Files) ---
+        self.left_layout = QVBoxLayout()
+        self.source_files_label = QLabel("Source Files:")
+        self.left_layout.addWidget(self.source_files_label)
+        self.file_list_widget = QListWidget()
+        self.file_list_widget.itemClicked.connect(self.select_file)
+        self.left_layout.addWidget(self.file_list_widget)
+        # --- Center Layout (Working Area: Video & Waveform) ---
+        self.center_layout = QVBoxLayout()
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumSize(640, 480)
+        self.center_layout.addWidget(self.video_widget)
+        self.player.setVideoOutput(self.video_widget)
+        self.waveform_plot = pg.PlotWidget()
+        self.waveform_plot.setLabel('bottom', 'Time (s)')
+        self.waveform_plot.setLabel('left', 'Amplitude')
+        self.waveform_plot.setFixedHeight(200)
+        self.waveform_plot.enableAutoRange('x', False)
+        self.waveform_plot.setAutoVisible(x=False)
+        self.waveform_curve = self.waveform_plot.plot(pen='c')
+        self.cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#FFFF00', width=2))
+        self.waveform_plot.addItem(self.cursor)
+        self.start_marker = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#00FF00', width=2, style=Qt.PenStyle.DashLine))
+        self.start_marker.setVisible(False)
+        self.waveform_plot.addItem(self.start_marker)
+        self.start_marker.sigPositionChanged.connect(self.update_start_time)
+        self.end_marker = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen('#FF0000', width=2, style=Qt.PenStyle.DashLine))
+        self.end_marker.setVisible(False)
+        self.waveform_plot.addItem(self.end_marker)
+        self.end_marker.sigPositionChanged.connect(self.update_end_time)
+        self.center_layout.addWidget(self.waveform_plot)
+        # --- Right Layout (Clips) ---
+        self.right_layout = QVBoxLayout()
+        self.clip_list_label = QLabel("Clips:")
+        self.right_layout.addWidget(self.clip_list_label)
+        self.clip_list = QListWidget()
+        self.clip_list.itemClicked.connect(self.select_clip)
+        self.right_layout.addWidget(self.clip_list)
+        self.clip_buttons_layout = QHBoxLayout()
+        self.edit_button = QPushButton("Edit")
+        self.edit_button.clicked.connect(self.edit_clip)
+        self.edit_button.setEnabled(False)
+        self.clip_buttons_layout.addWidget(self.edit_button)
+        self.delete_button = QPushButton("Delete")
+        self.delete_button.clicked.connect(self.delete_clip)
+        self.delete_button.setEnabled(False)
+        self.clip_buttons_layout.addWidget(self.delete_button)
+        self.right_layout.addLayout(self.clip_buttons_layout)
+        # ---Add layouts to main_layout ---
+        self.main_layout.addLayout(self.left_layout, 1)
+        self.main_layout.addLayout(self.center_layout, 3)
+        self.main_layout.addLayout(self.right_layout, 1)
+        # Timer setup
+        self.timer.timeout.connect(self.update_waveform_cursor)
+        # Waveform zooming and double-click
+        view_box = self.waveform_plot.getViewBox()
+        view_box.setMouseEnabled(x=True, y=True)
+        view_box.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
+        def wheelEvent(event, axis=None):
+            mouse_pos = view_box.mapSceneToView(event.pos())
+            mouse_x, mouse_y = mouse_pos.x(), mouse_pos.y()
+            x_range, y_range = view_box.viewRange()
+            x_min, x_max = x_range[0], x_range[1]
+            y_min, y_max = y_range[0], y_range[1]
+            x_span = x_max - x_min
+            y_span = y_max - y_min
+            zoom_factor = 1.2 if event.delta() < 0 else 1 / 1.2
+            new_x_span = x_span * zoom_factor
+            new_y_span = y_span * zoom_factor
+            new_x_span = max(new_x_span, 0.1)
+            new_y_span = max(new_y_span, 0.02)
+            x_ratio = (mouse_x - x_min) / x_span
+            new_x_min = mouse_x - new_x_span * x_ratio
+            new_x_max = mouse_x + new_x_span * (1 - x_ratio)
+            clamp_x_min, clamp_x_max = (self.start_time, self.end_time) if self.start_time and self.end_time else (0, self.video_duration)
+            if new_x_span > (clamp_x_max - clamp_x_min):
+                new_x_span = clamp_x_max - clamp_x_min
+                new_x_min = clamp_x_min
+                new_x_max = clamp_x_max
+            else:
+                if new_x_min < clamp_x_min:
+                    new_x_min = clamp_x_min
+                    new_x_max = new_x_min + new_x_span
+                if new_x_max > clamp_x_max:
+                    new_x_max = clamp_x_max
+                    new_x_min = new_x_max - new_x_span
+            y_ratio = (mouse_y - y_min) / y_span
+            new_y_min = mouse_y - new_y_span * y_ratio
+            new_y_max = mouse_y + new_y_span * (1 - y_ratio)
+            view_box.setRange(xRange=(new_x_min, new_x_max), yRange=(new_y_min, new_y_max), padding=0)
+        def mouseDoubleClickEvent(event):
+            if self.audio_waveform:
+                x_min, x_max = (self.start_time, self.end_time) if self.start_time and self.end_time else (0, self.video_duration)
+                _, samples = self.audio_waveform
+                if samples.size > 0:
+                    if self.start_time and self.end_time:
+                        time_axis, samples = self.audio_waveform
+                        sample_rate = len(time_axis) / self.video_duration if self.video_duration > 0 else1
+                        start_idx = int(self.start_time * sample_rate)
+                        end_idx = int(self.end_time * sample_rate)
+                        start_idx = max(0, min(start_idx, len(samples) - 1))
+                        end_idx = max(start_idx, min(end_idx, len(samples)))
+                        if start_idx < end_idx:
+                            clip_samples = samples[start_idx:end_idx]
+                            max_amplitude = np.max(np.abs(clip_samples))
+                            max_amplitude = max(max_amplitude * 1.1, 0.1)
+                        else:
+                            max_amplitude = 0.1
+                    else:
+                        max_amplitude = np.max(np.abs(samples))
+                        max_amplitude = max(max_amplitude * 1.1, 0.1)
+                    y_min, y_max = -max_amplitude, max_amplitude
+                else:
+                    y_min, y_max = -1, 1
+                view_box.setRange(xRange=(x_min, x_max), yRange=(y_min, y_max), padding=0)
+        view_box.wheelEvent = wheelEvent
+        view_box.mouseDoubleClickEvent = mouseDoubleClickEvent
+    def setup_menu_bar(self):
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        self.load_folder_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon), "&Load Folder", self,
+                                          shortcut="Ctrl+O", triggered=self.load_folder)
+        file_menu.addAction(self.load_folder_action)
+        exit_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton), "E&xit", self,
+                              shortcut="Ctrl+Q", triggered=self.close_application)
+        file_menu.addAction(exit_action)
+
+        playback_menu = menu_bar.addMenu("&Playback")
+        self.play_pause_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "&Play/Pause", self,
+                                         shortcut="Space", triggered=self.toggle_play_pause)
+        playback_menu.addAction(self.play_pause_action)
+        if os.path.exists('assets/start_marker_icon.svg'):
+            self.mark_start_action = QAction(QIcon('assets/start_marker_icon.svg'), "&Mark Start", self,
+                                             shortcut="Ctrl+[", triggered=self.mark_start)
+        else:
+            self.mark_start_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekBackward), "&Mark Start", self,
+                                             shortcut="Ctrl+[", triggered=self.mark_start)
+        playback_menu.addAction(self.mark_start_action)
+        if os.path.exists('assets/end_marker_icon.svg'):
+            self.mark_end_action = QAction(QIcon('assets/end_marker_icon.svg'), "&Mark End", self,
+                                           shortcut="Ctrl+]", triggered=self.mark_end)
+        else:
+            self.mark_end_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekForward), "&Mark End", self,
+                                           shortcut="Ctrl+]", triggered=self.mark_end)
+        playback_menu.addAction(self.mark_end_action)
+        self.rotate_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "&Rotate Video", self,
+                                     shortcut="Ctrl+R", triggered=self.rotate_video)
+        playback_menu.addAction(self.rotate_action)
+        self.export_clip_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "&Export Clip", self,
+                                          shortcut="Ctrl+S", triggered=self.save_clip_and_export)
+        playback_menu.addAction(self.export_clip_action)
+    def setup_toolbar(self):
+        self.toolbar.addAction(self.load_folder_action)
+        self.toolbar.addAction(self.play_pause_action)
+        self.play_pause_action.setEnabled(False)
+        self.toolbar.addAction(self.rotate_action)
+        self.rotate_action.setEnabled(False)
+        if os.path.exists('assets/start_marker_icon.svg'):
+            self.mark_start_action.setIcon(QIcon('assets/start_marker_icon.svg'))
+        else:
+            self.mark_start_action.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekBackward))
+        self.toolbar.addAction(self.mark_start_action)
+        self.mark_start_action.setEnabled(False)
+        if os.path.exists('assets/end_marker_icon.svg'):
+            self.mark_end_action.setIcon(QIcon('assets/end_marker_icon.svg'))
+        else:
+            self.mark_end_action.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekForward))
+        self.toolbar.addAction(self.mark_end_action)
+        self.mark_end_action.setEnabled(False)
+        self.toolbar.addSeparator()
+        self.video_label = QLabel("Exam Type:")
+        self.toolbar.addWidget(self.video_label)
+        self.video_dropdown = QComboBox()
+        self.video_dropdown.addItems(["", "Endoscopic Exam", "Acoustic Exam", "Audio Only"])
+        self.video_dropdown.currentTextChanged.connect(self.update_dropdown_states)
+        self.toolbar.addWidget(self.video_dropdown)
+        self.scope_label = QLabel("Scope Type:")
+        self.scope_label.setStyleSheet("QLabel { color: black; }")
+        self.toolbar.addWidget(self.scope_label)
+        self.scope_dropdown = QComboBox()
+        self.scope_dropdown.addItems(["", "Rigid", "Flexible"])
+        self.scope_dropdown.setStyleSheet("QComboBox:disabled { color: gray; } QComboBox { color: black; }")
+        self.toolbar.addWidget(self.scope_dropdown)
+        self.light_label = QLabel("Light Type:")
+        self.light_label.setStyleSheet("QLabel { color: black; }")
+        self.toolbar.addWidget(self.light_label)
+        self.light_dropdown = QComboBox()
+        self.light_dropdown.addItems(["", "Strobe", "Halogen"])
+        self.light_dropdown.setStyleSheet("QComboBox:disabled { color: gray; } QComboBox { color: black; }")
+        self.toolbar.addWidget(self.light_dropdown)
+        self.speech_label = QLabel("Speech Type:")
+        self.speech_label.setStyleSheet("QLabel { color: black; }")
+        self.toolbar.addWidget(self.speech_label)
+        self.speech_dropdown = QComboBox()
+        self.speech_dropdown.addItems(self.speech_types + ["<new>"])
+        self.speech_dropdown.currentTextChanged.connect(self.handle_speech_type_selection)
+        self.speech_dropdown.setStyleSheet("QComboBox:disabled { color: gray; } QComboBox { color: black; }")
+        self.toolbar.addWidget(self.speech_dropdown)
+        self.toolbar.addSeparator()
+        self.toolbar.addAction(self.export_clip_action)
+        self.export_clip_action.setEnabled(False)
+    def load_speech_types(self):
+        default_speech_types = ["", "Vowel - ehh", "Vowel - ahh", "Sentences", "Rainbow Passage"]
+        try:
+            if os.path.exists(self.global_config_file):
+                with open(self.global_config_file, 'r') as f:
+                    data = json.load(f)
+                    return data.get("speech_types", default_speech_types)
+            else:
+                return default_speech_types
+        except (json.JSONDecodeError, IOError):
+            return default_speech_types
+
+    def save_speech_types(self):
+        try:
+            with open(self.global_config_file, 'w') as f:
+                json.dump({"speech_types": self.speech_types}, f, indent=4)
+        except IOError as e:
+            QMessageBox.warning(self, "Error", f"Failed to save speech types: {str(e)}")
+
+    def load_user_config(self):
+        default_config = {"default_folder": str(Path.home())}
+        try:
+            if self.user_config_file.exists():
+                with open(self.user_config_file, 'r') as f:
+                    data = json.load(f)
+                    return data
+            else:
+                return default_config
+        except (json.JSONDecodeError, IOError):
+            return default_config
+
+    def save_user_config(self, folder_path):
+        config = {"default_folder": folder_path}
+        try:
+            with open(self.user_config_file, 'w') as f:
+                json.dump(config, f, indent=4)
+        except IOError as e:
+            QMessageBox.warning(self, "Error", f"Failed to save user config: {str(e)}")
+    def load_default_folder(self):
+        config = self.load_user_config()
+        default_folder = config.get("default_folder")
+        try:
+            if default_folder and os.path.isdir(default_folder):
+                self.folder = default_folder
+                self.trimmed_folder = os.path.join(self.folder, "TrimmedClips")
+                os.makedirs(self.trimmed_folder, exist_ok=True)
+                self.file_list = [f for f in os.listdir(self.folder) if f.endswith(".mp4") and os.path.isfile(os.path.join(self.folder, f))]
+                if self.file_list:
+                    self.file_list_widget.clear()
+                    for file_name in self.file_list:
+                        item = QListWidgetItem(file_name)
+                        item.setData(Qt.ItemDataRole.UserRole, file_name)  # Updated to ItemDataRole.UserRole
+                        self.file_list_widget.addItem(item)
+                else:
+                    print(f"No .mp4 files found in default folder: {self.folder}")
+            else:
+                print(f"Default folder not set or invalid: {default_folder}")
+        except (PermissionError, OSError) as e:
+            QMessageBox.warning(self, "Folder Error", f"Cannot access default folder: {str(e)}")
+    def load_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", self.load_user_config().get("default_folder", ""))
+        if folder:
+            try:
+                self.folder = folder
+                self.trimmed_folder = os.path.join(self.folder, "TrimmedClips")
+                os.makedirs(self.trimmed_folder, exist_ok=True)
+                self.file_list = [f for f in os.listdir(self.folder) if f.endswith(".mp4") and os.path.isfile(os.path.join(self.folder, f))]
+                self.file_list_widget.clear()
+                for file_name in self.file_list:
+                    item = QListWidgetItem(file_name)
+                    item.setData(Qt.ItemDataRole.UserRole, file_name)  # Updated to ItemDataRole.UserRole
+                    self.file_list_widget.addItem(item)
+                self.save_user_config(folder)
+                self.load_all_annotations()
+                print(f"Default folder set to: {folder}")
+            except (PermissionError, OSError) as e:
+                QMessageBox.warning(self, "Folder Error", f"Cannot access folder: {str(e)}")
+    def load_all_annotations(self):
+        self.annotations = []
+        annotations_file = os.path.join(self.folder, "annotations.xlsx")
+        if os.path.exists(annotations_file):
+            try:
+                df = pd.read_excel(annotations_file)
+                for index, row in df.iterrows():
+                    clip_info = [
+                        row["Start Time"], row["End Time"], row["Exam Type"],
+                        row["Scope Type"], row["Light Type"], row["Speech Type"],
+                        row["Clip File"], row["Source File"]
+                    ]
+                    self.annotations.append(clip_info)
+                print(f"Loaded {len(self.annotations)} annotations from {annotations_file}")
+            except Exception as e:
+                print(f"Error loading annotations: {str(e)}")
+        else:
+            print(f"No annotations file found at: {annotations_file}")
+    def load_clips(self):
+        self.clip_list.clear()
+        if not self.current_file:
+            print("No current file selected, cannot load clips.")
+            return
+        current_source_file = os.path.basename(self.current_file)
+        print(f"Loading clips for source file: {current_source_file}")
+        print(f"Total annotations: {len(self.annotations)}")
+        for index, clip in enumerate(self.annotations):
+            if clip[7] == current_source_file:
+                item = QListWidgetItem(clip[6])
+                item.setData(Qt.ItemDataRole.UserRole, index)  # Updated to ItemDataRole.UserRole
+                self.clip_list.addItem(item)
+                print(f"Added clip: {clip[6]}")
+    def select_clip(self, item):
+        index = item.data(Qt.ItemDataRole.UserRole)  # Updated to ItemDataRole.UserRole
+        clip = self.annotations[index]
+        self.start_time = clip[0]
+        self.end_time = clip[1]
+        self.video_dropdown.setCurrentText(clip[2])
+        self.scope_dropdown.setCurrentText(clip[3])
+        self.light_dropdown.setCurrentText(clip[4])
+        self.speech_dropdown.setCurrentText(clip[5])
+        self.start_marker.setPos(self.start_time)
+        self.start_marker.setVisible(True)
+        self.end_marker.setPos(self.end_time)
+        self.end_marker.setVisible(True)
+        self.player.setPosition(int(self.start_time * 1000))
+        self.edit_button.setEnabled(True)
+        self.delete_button.setEnabled(True)
+       
+        if self.audio_waveform:
+            self.waveform_plot.setXRange(self.start_time, self.end_time, padding=0)
+            time_axis, samples = self.audio_waveform
+            sample_rate = len(time_axis) / self.video_duration if self.video_duration > 0 else 1
+            start_idx = int(self.start_time * sample_rate)
+            end_idx = int(self.end_time * sample_rate)
+            start_idx = max(0, min(start_idx, len(samples) - 1))
+            end_idx = max(start_idx, min(end_idx, len(samples)))
+            if start_idx < end_idx:
+                clip_samples = samples[start_idx:end_idx]
+                max_amplitude = np.max(np.abs(clip_samples))
+                max_amplitude = max(max_amplitude * 1.1, 0.1)
+                self.waveform_plot.setYRange(-max_amplitude, max_amplitude, padding=0)
+            else:
+                self.waveform_plot.setYRange(-0.1, 0.1, padding=0)
+    def edit_clip(self):
+        selected_items = self.clip_list.selectedItems()
+        if not selected_items:
+            return
+        item = selected_items[0]
+        index = item.data(Qt.ItemDataRole.UserRole)  # Updated to ItemDataRole.UserRole
+        clip = self.annotations[index]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Clip")
+        layout = QGridLayout(dialog)
+        layout.addWidget(QLabel("Start Time:"), 0, 0)
+        start_input = QLineEdit(str(clip[0]))
+        start_input.setReadOnly(True)
+        layout.addWidget(start_input, 0, 1)
+        layout.addWidget(QLabel("End Time:"), 1, 0)
+        end_input = QLineEdit(str(clip[1]))
+        end_input.setReadOnly(True)
+        layout.addWidget(end_input, 1, 1)
+
+        layout.addWidget(QLabel("Exam Type:"), 2, 0)
+        video_edit = QComboBox()
+        video_edit.addItems(["", "Endoscopic Exam", "Acoustic Exam", "Audio Only"])
+        video_edit.setCurrentText(clip[2])
+        layout.addWidget(video_edit, 2, 1)
+        layout.addWidget(QLabel("Scope Type:"), 3, 0)
+        scope_edit = QComboBox()
+        scope_edit.addItems(["", "Rigid", "Flexible"])
+        scope_edit.setCurrentText(clip[3])
+        layout.addWidget(scope_edit, 3, 1)
+        layout.addWidget(QLabel("Light Type:"), 4, 0)
+        light_edit = QComboBox()
+        light_edit.addItems(["", "Strobe", "Halogen"])
+        light_edit.setCurrentText(clip[4])
+        layout.addWidget(light_edit, 4, 1)
+        layout.addWidget(QLabel("Speech Type:"), 5, 0)
+        speech_edit = QComboBox()
+        speech_edit.addItems(self.speech_types + ["<new>"])
+        speech_edit.setCurrentText(clip[5])
+        layout.addWidget(speech_edit, 5, 1)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(lambda: self.save_edited_clip(dialog, index, start_input.text(), end_input.text(),
+                                                              video_edit.currentText(), scope_edit.currentText(),
+                                                              light_edit.currentText(), speech_edit.currentText()))
+        layout.addWidget(save_btn, 6, 0)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        layout.addWidget(cancel_btn, 6, 1)
+        dialog.exec()
+    def save_edited_clip(self, dialog, index, start_str, end_str, video, scope, light, speech):
+        try:
+            clip = self.annotations[index]
+            start_time = clip[0]
+            end_time = clip[1]
+            clip[0] = start_time
+            clip[1] = end_time
+            clip[2] = video
+            clip[3] = scope
+            clip[4] = light
+            clip[5] = speech
+            self.export_annotations()
+            self.load_clips()
+            dialog.accept()
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "An unexpected error occurred.")
+    def delete_clip(self):
+        selected_items = self.clip_list.selectedItems()
+        if not selected_items:
+            return
+        item = selected_items[0]
+        index = item.data(Qt.ItemDataRole.UserRole)  # Updated to ItemDataRole.UserRole
+        clip_file = self.annotations[index][6]
+        exam_type = self.annotations[index][2]
+        reply = QMessageBox.question(self, "Confirm Delete", f"Delete clip {clip_file}?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            extension = ".wav" if exam_type == "Audio Only" else ".mp4"
+            clip_path = os.path.join(self.trimmed_folder, f"{clip_file}{extension}")
+            try:
+                if os.path.exists(clip_path):
+                    os.remove(clip_path)
+                    print(f"Deleted file: {clip_path}")
+                else:
+                    print(f"File not found, removing from annotations anyway: {clip_path}")
+            except Exception as e:
+                print(f"Error deleting file {clip_path}: {str(e)}")
+           
+            del self.annotations[index]
+            self.export_annotations()
+            self.load_clips()
+            self.start_marker.setVisible(False)
+            self.end_marker.setVisible(False)
+            self.edit_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
+    def handle_speech_type_selection(self, selected_text):
+        if selected_text == "<new>":
+            new_speech_type, ok = QInputDialog.getText(self, "New Speech Type", "Enter a new speech type:")
+            if ok and new_speech_type.strip():
+                if new_speech_type not in self.speech_types:
+                    self.speech_types.append(new_speech_type)
+                    self.save_speech_types()
+                    self.update_speech_dropdown(new_speech_type)
+                else:
+                    QMessageBox.warning(self, "Duplicate", "This speech type already exists.")
+            else:
+                self.speech_dropdown.setCurrentIndex(0)
+        elif selected_text:
+            print(f"Selected speech type: {selected_text}")
+
+    def update_speech_dropdown(self, new_selection):
+        self.speech_dropdown.blockSignals(True)
+        self.speech_dropdown.clear()
+        self.speech_dropdown.addItems(self.speech_types + ["<new>"])
+        self.speech_dropdown.setCurrentText(new_selection)
+        self.speech_dropdown.blockSignals(False)
+    def update_dropdown_states(self, selected_text):
+        if selected_text in ["Acoustic Exam", "Audio Only"]:
+            self.scope_dropdown.setEnabled(False)
+            self.light_dropdown.setEnabled(False)
+            self.scope_dropdown.setStyleSheet("QComboBox:disabled { color: gray; } QComboBox { color: black; }")
+            self.light_dropdown.setStyleSheet("QComboBox:disabled { color: gray; } QComboBox { color: black; }")
+            self.speech_dropdown.setEnabled(True)
+            self.speech_dropdown.setStyleSheet("QComboBox { color: black; }")
+            self.scope_label.setStyleSheet("QLabel { color: gray; }")
+            self.light_label.setStyleSheet("QLabel { color: gray; }")
+            self.speech_label.setStyleSheet("QLabel { color: black; }")
+        else:
+            self.scope_dropdown.setEnabled(True)
+            self.light_dropdown.setEnabled(True)
+            self.speech_dropdown.setEnabled(True)
+            self.scope_dropdown.setStyleSheet("QComboBox { color: black; }")
+            self.light_dropdown.setStyleSheet("QComboBox { color: black; }")
+            self.speech_dropdown.setStyleSheet("QComboBox { color: black; }")
+            self.scope_label.setStyleSheet("QLabel { color: black; }")
+            self.light_label.setStyleSheet("QLabel { color: black; }")
+            self.speech_label.setStyleSheet("QLabel { color: black; }")
+    def update_start_time(self):
+        self.start_time = max(0, self.start_marker.value())
+        print(f"Start time updated: {self.start_time:.2f} seconds")
+        self.player.setPosition(int(self.start_time * 1000))
+    def update_end_time(self):
+        self.end_time = max(self.start_time if self.start_time is not None else 0, self.end_marker.value())
+        print(f"End time updated: {self.end_time:.2f} seconds")
+        self.player.setPosition(int(self.end_time * 1000))
+    def select_file(self, item):
+        if item is not None:
+            file_name = item.data(Qt.ItemDataRole.UserRole)  # Updated to ItemDataRole.UserRole
+            print(f"Selected file: {file_name}")
+            self.player.stop()
+            self.current_file = os.path.join(self.folder, file_name)
+            print(f"Current file set to: {self.current_file}")
+            self.play_pause_action.setEnabled(True)
+            self.mark_start_action.setEnabled(True)
+            self.mark_end_action.setEnabled(True)
+            self.export_clip_action.setEnabled(True)
+            self.rotate_action.setEnabled(True)
+            self.start_marker.setVisible(False)
+            self.end_marker.setVisible(False)
+            self.start_time = None
+            self.end_time = None
+            self.load_clips()
+           
+            self.player.setSource(QUrl.fromLocalFile(self.current_file))
+            self.player.durationChanged.connect(self.set_video_duration)
+            self.extract_audio_waveform()
+            if self.audio_waveform:
+                self.waveform_plot.setXRange(0, self.video_duration, padding=0)
+                _, samples = self.audio_waveform
+                if samples.size > 0:
+                    max_amplitude = np.max(np.abs(samples))
+                    max_amplitude = max(max_amplitude * 1.1, 0.1)
+                    self.waveform_plot.setYRange(-max_amplitude, max_amplitude, padding=0)
+                else:
+                    self.waveform_plot.setYRange(-1, 1, padding=0)
+    def set_video_duration(self, duration):
+        self.video_duration = duration / 1000.0
+        print(f"Video duration set to: {self.video_duration:.2f} seconds")
+    def toggle_play_pause(self):
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please select a file to play.")
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.timer.stop()
+            self.play_pause_action.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.play_pause_action.setText("Play")
+        else:
+            self.player.play()
+            self.timer.start(30)
+            self.play_pause_action.setIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.play_pause_action.setText("Pause")
+    def update_waveform_cursor(self):
+        current_time = self.player.position() / 1000.0
+        self.cursor.setPos(current_time)
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+            self.timer.stop()
+
+    def extract_audio_waveform(self):
+        if not self.current_file:
+            print("No current file to extract waveform.")
+            return
+        print(f"Extracting waveform for: {self.current_file}")
+        try:
+            stream = ffmpeg.input(self.current_file)
+            stream = stream.output('pipe:', format='wav', acodec='pcm_s16le', loglevel="quiet")
+            out, _ = ffmpeg.run(stream, capture_stdout=True)
+            audio = AudioSegment.from_file(io.BytesIO(out), format="wav")
+            samples = np.array(audio.get_array_of_samples())
+            samples = samples.astype(np.float32) / np.iinfo(audio.array_type).max
+            audio_duration = len(samples) / audio.frame_rate
+            if abs(audio_duration - self.video_duration) > 0.1:
+                print(f"Warning: Audio duration ({audio_duration:.2f}s) differs from video ({self.video_duration:.2f}s)")
+            time_axis = np.linspace(0, self.video_duration, num=len(samples))
+            print(f"Waveform samples length: {len(samples)}, time_axis length: {len(time_axis)}")
+            self.waveform_curve.setData(time_axis, samples)
+            self.audio_waveform = (time_axis, samples)
+            self.waveform_plot.setXRange(0, self.video_duration, padding=0)
+            if samples.size > 0:
+                max_amplitude = np.max(np.abs(samples))
+                max_amplitude = max(max_amplitude * 1.1, 0.1)
+                self.waveform_plot.setYRange(-max_amplitude, max_amplitude, padding=0)
+            else:
+                self.waveform_plot.setYRange(-1, 1, padding=0)
+        except ffmpeg.Error as e:
+            QMessageBox.critical(self, "FFmpeg Error", f"Error extracting audio: {str(e.stderr.decode() if e.stderr else e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Waveform Error", f"Unexpected error: {str(e)}")
+    def mark_start(self):
+        self.start_time = self.player.position() / 1000.0
+        if self.start_time is not None:
+            print(f"Start marked: {self.start_time:.2f} seconds")
+            self.start_marker.setVisible(True)
+            self.start_marker.setPos(self.start_time)
+    def mark_end(self):
+        self.end_time = self.player.position() / 1000.0
+        if self.end_time is not None:
+            print(f"End marked: {self.end_time:.2f} seconds")
+            self.end_marker.setVisible(True)
+            self.end_marker.setPos(self.end_time)
+    def save_clip_and_export(self):
+        if self.start_time is None or self.end_time is None or self.start_time >= self.end_time:
+            QMessageBox.warning(self, "Invalid Selection", "Please select valid start and end points.")
+            return
+        file_path = os.path.join(self.folder, self.current_file)
+        source_file = os.path.basename(self.current_file)
+        video = self.video_dropdown.currentText()
+        scope = self.scope_dropdown.currentText()
+        light = self.light_dropdown.currentText()
+        speech = self.speech_dropdown.currentText()
+        try:
+            source_base = os.path.splitext(source_file)[0]
+            if video == "Audio Only":
+                clip_name_base = f"audio_{source_base}_{self.start_time:.2f}_{self.end_time:.2f}"
+                output_file = os.path.join(self.trimmed_folder, f"{clip_name_base}.wav")
+                stream = ffmpeg.input(file_path, ss=self.start_time, t=self.end_time - self.start_time)
+                stream = ffmpeg.output(stream, output_file, format='wav', acodec='pcm_s16le', loglevel="quiet")
+                ffmpeg.run(stream, overwrite_output=True)
+                QMessageBox.information(self, "Success", f"Audio clip saved to TrimmedClips as {clip_name_base}")
+            else:
+                clip_name_base = f"clip_{source_base}_{self.start_time:.2f}_{self.end_time:.2f}"
+                output_file = os.path.join(self.trimmed_folder, f"{clip_name_base}.mp4")
+                stream = ffmpeg.input(file_path, ss=self.start_time, t=self.end_time - self.start_time)
+                stream = ffmpeg.output(stream, output_file, c='copy', loglevel="quiet")
+                ffmpeg.run(stream, overwrite_output=True)
+                QMessageBox.information(self, "Success", f"Video clip saved to TrimmedClips as {clip_name_base}")
+            self.annotations.append([self.start_time, self.end_time, video, scope, light, speech, clip_name_base, source_file])
+            self.export_annotations()
+            self.load_clips()
+        except ffmpeg.Error as e:
+            QMessageBox.critical(self, "Error", f"Failed to save clip: {str(e.stderr.decode() if e.stderr else e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {str(e)}")
+    def export_annotations(self):
+        try:
+            df = pd.DataFrame(self.annotations, columns=[
+                "Start Time", "End Time", "Exam Type", "Scope Type", "Light Type", "Speech Type", "Clip File", "Source File"
+            ])
+            df.to_excel(os.path.join(self.folder, "annotations.xlsx"), index=False)
+            print(f"Annotations updated in {os.path.join(self.folder, 'annotations.xlsx')}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update annotations.xlsx: {str(e)}")
+    def close_application(self):
+        self.timer.stop()
+        self.player.stop()
+        QApplication.quit()
+    def rotate_video(self):
+        self.rotation_angle = (self.rotation_angle + 90) % 360
+        # Note: QMediaPlayer doesn't support rotation natively
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = LiveAnnotationTool()
+    window.show()
+    sys.exit(app.exec())
+
