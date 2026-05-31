@@ -1,0 +1,108 @@
+Python Code for Inference
+
+# inference.py
+import os
+import torch
+import torchaudio
+import subprocess
+from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2FeatureExtractor
+# Config
+MODEL_DIR = "./results/checkpoint-final"
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Segmenting parameters
+WINDOW_SIZE = 2.0   # seconds per small window
+STRIDE = 2.0        # step size (no overlap here)
+# Duration rules
+RULES = {
+    "ahh": (1, 4),
+    "ehh": (1, 4),
+    "rainbow": (10, 30)
+}
+NEGATIVE_LABELS = ["silence", "crosstalk", "negative"]
+# Load Model
+print("📥 Loading model...")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Wav2Vec2ForSequenceClassification.from_pretrained(MODEL_DIR).to(device)
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_DIR)
+# Helper: extract audio with ffmpeg
+def extract_audio(input_file, output_wav, sr=16000):
+    cmd = [
+        "ffmpeg", "-y", "-i", input_file,
+        "-ac", "1", "-ar", str(sr),
+        output_wav
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+# Helper: predict label for a clip
+def predict_clip(waveform, sr):
+    inputs = feature_extractor(
+        waveform.squeeze().numpy(),
+        sampling_rate=sr,
+        return_tensors="pt",
+        padding=True
+    )
+    with torch.no_grad():
+        logits = model(inputs.input_values.to(device)).logits
+        pred_id = torch.argmax(logits, dim=-1).item()
+    return model.config.id2label[pred_id]
+# Main Inference
+def run_inference(input_mp4):
+    print(f"🎬 Processing {input_mp4}...")
+    temp_wav = os.path.join(OUTPUT_DIR, "temp.wav")
+    extract_audio(input_mp4, temp_wav, sr=16000)
+    waveform, sr = torchaudio.load(temp_wav)
+    total_duration = waveform.shape[1] / sr
+    results = []
+    # Step 1: Predict short windows
+    start = 0.0
+    while start < total_duration:
+        end = min(start + WINDOW_SIZE, total_duration)
+        clip = waveform[:, int(start*sr):int(end*sr)]
+        if clip.shape[1] > 0:
+            label = predict_clip(clip, sr)
+            results.append((label, start, end))
+        start += STRIDE
+    # Step 2: Merge consecutive windows with same label
+    merged = []
+    for label, start, end in results:
+        if not merged:
+            merged.append([label, start, end])
+        else:
+            last_label, last_start, last_end = merged[-1]
+            if label == last_label:
+                merged[-1][2] = end  # extend segment
+            else:
+                merged.append([label, start, end])
+    # Step 3: Apply rules + save (forced clean names)
+    seg_id = 1
+    forced_names = ["rainbow", "ehh", "ahh"]  # name order
+    for label, start, end in merged:
+        duration = end - start
+        if label in NEGATIVE_LABELS:
+            print(f"⏭️ Skipping {label} ({duration:.2f}s)")
+            continue
+        if label in RULES:
+            min_dur, max_dur = RULES[label]
+            if duration < min_dur or duration > max_dur:
+                print(f"⏭️ Skipping {label} ({duration:.2f}s not in {min_dur}-{max_dur}s)")
+                continue
+        # pick clean forced label (no numbering)
+        if seg_id <= len(forced_names):
+            forced_label = forced_names[seg_id - 1]
+        else:
+            forced_label = label  # fallback if extra segments appear
+        print(f"✅ Saving {forced_label} | {start:.2f}s–{end:.2f}s | {duration:.2f}s")
+        # save mp3
+        out_mp3 = os.path.join(OUTPUT_DIR, f"{forced_label}.mp3")
+        cmd = ["ffmpeg", "-y", "-i", temp_wav, "-ss", str(start), "-to", str(end), out_mp3]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # save mp4
+        out_mp4 = os.path.join(OUTPUT_DIR, f"{forced_label}.mp4")
+        cmd = ["ffmpeg", "-y", "-i", input_mp4, "-ss", str(start), "-to", str(end), "-c", "copy", out_mp4]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        seg_id += 1
+# Run
+if __name__ == "__main__":
+    run_inference("example.mp4")  # change input file here
+ 
