@@ -1,0 +1,82 @@
+Python Code for Streamlit User Interface
+
+#gui.py
+import os, torch, torchaudio, subprocess, streamlit as st
+from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2FeatureExtractor
+MODEL_DIR = "./results/checkpoint-final"
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+WINDOW_SIZE, STRIDE = 2.0, 2.0
+RULES = {"ahh": (1, 4), "ehh": (1, 4), "rainbow": (10, 30)}
+NEGATIVE_LABELS = ["silence", "crosstalk", "negative"]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+@st.cache_resource
+def load_model():
+    model = Wav2Vec2ForSequenceClassification.from_pretrained(MODEL_DIR).to(device)
+    feat = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_DIR)
+    return model, feat
+model, feature_extractor = load_model()
+def extract_audio(infile, outwav, sr=16000):
+    subprocess.run(["ffmpeg","-y","-i",infile,"-ac","1","-ar",str(sr),outwav],
+                   stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+def predict_clip(waveform, sr):
+    inp = feature_extractor(waveform.squeeze().numpy(),sampling_rate=sr,
+                            return_tensors="pt",padding=True)
+    with torch.no_grad():
+        logits = model(inp.input_values.to(device)).logits
+    return model.config.id2label[torch.argmax(logits,dim=-1).item()]
+def run_inference(input_mp4):
+    temp_wav = os.path.join(OUTPUT_DIR,"temp.wav")
+    extract_audio(input_mp4,temp_wav,16000)
+    waveform, sr = torchaudio.load(temp_wav)
+    total_dur = waveform.shape[1]/sr
+    results, start = [], 0.0
+    while start < total_dur:
+        end = min(start+WINDOW_SIZE,total_dur)
+        clip = waveform[:,int(start*sr):int(end*sr)]
+        if clip.shape[1]>0:
+            label = predict_clip(clip,sr)
+            results.append((label,start,end))
+        start += STRIDE
+    merged=[]
+    for label,s,e in results:
+        if not merged or label!=merged[-1][0]:
+            merged.append([label,s,e])
+        else:
+            merged[-1][2]=e
+    segs=[]
+    for i,(label,s,e) in enumerate(merged,1):
+        dur=e-s
+        if label in NEGATIVE_LABELS: continue
+        if label in RULES:
+            mn,mx=RULES[label]
+            if not (mn<=dur<=mx): continue
+        mp3=os.path.join(OUTPUT_DIR,f"{label}_{i}.mp3")
+        mp4=os.path.join(OUTPUT_DIR,f"{label}_{i}.mp4")
+        subprocess.run(["ffmpeg","-y","-i",temp_wav,"-ss",str(s),"-to",str(e),mp3],
+                       stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        subprocess.run(["ffmpeg","-y","-i",input_mp4,"-ss",str(s),"-to",str(e),
+                        "-c","copy",mp4],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        segs.append((label,dur,mp3,mp4))
+    return segs
+st.title("🎧 Automatic Voice Segmentation Tool")
+st.write("Upload an `.mp4` file to detect and extract **ahh**, **ehh**, and **rainbow** segments automatically.")
+upload = st.file_uploader("Choose MP4 file",type=["mp4"])
+if upload:
+    path=os.path.join(OUTPUT_DIR,upload.name)
+    with open(path,"wb") as f: f.write(upload.read())
+    st.video(path)
+    if st.button("Run Segmentation"):
+        with st.spinner("Running..."):
+            segs=run_inference(path)
+        if segs:
+            st.success(f" Extracted {len(segs)} valid segments.")
+            for lbl,dur,mp3,mp4 in segs:
+                st.markdown(f"**{lbl}** ({dur:.2f}s)")
+                st.audio(mp3)
+                st.download_button(f"Download {lbl}.mp3",open(mp3,"rb"),file_name=os.path.basename(mp3))
+                st.download_button(f"Download {lbl}.mp4",open(mp4,"rb"),file_name=os.path.basename(mp4))
+        else:
+            st.warning("No valid segments detected.")
+
+ 
