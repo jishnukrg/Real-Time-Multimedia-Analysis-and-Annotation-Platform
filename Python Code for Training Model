@@ -1,0 +1,124 @@
+Appendix B: Python Code for Training Model
+
+# train_model.py
+import os, subprocess, sys, shutil, tempfile
+import torch, torchaudio
+import numpy as np
+from datasets import Dataset
+from sklearn.metrics import accuracy_score, f1_score
+from transformers import (
+    Wav2Vec2ForSequenceClassification,
+    Wav2Vec2FeatureExtractor,
+    TrainingArguments,
+    Trainer,
+)
+#  Config 
+DATA_DIR   = "./data"
+CONVERTED_DIR = "./converted_wav"
+OUTPUT_DIR = "./results"
+SAMPLE_RATE = 16000
+LABELS = ["ahh", "ehh", "rainbow", "negative"]
+label2id = {l:i for i,l in enumerate(LABELS)}
+id2label = {i:l for i,l in enumerate(LABELS)}
+BASE_MODEL = "facebook/wav2vec2-base"
+os.makedirs(CONVERTED_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# -Step 1: Convert MKV → WAV into converted_wav 
+def convert_all():
+    print(" Converting MKV → WAV ...")
+    paths, labels = [], []
+    for label in LABELS:
+        src = os.path.join(DATA_DIR, label)
+        if not os.path.isdir(src):
+            continue
+        tgt = os.path.join(CONVERTED_DIR, label)
+        os.makedirs(tgt, exist_ok=True)
+        for root, _, files in os.walk(src):
+            for f in files:
+                if f.lower().endswith(".mkv"):
+                    src_path = os.path.join(root, f)
+                    tgt_path = os.path.join(tgt, os.path.splitext(f)[0] + ".wav")
+                    if not os.path.exists(tgt_path):
+                        cmd = ["ffmpeg", "-y", "-i", src_path, "-ac", "1", "-ar", str(SAMPLE_RATE), tgt_path]
+                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    paths.append(tgt_path)
+                    labels.append(label2id[label])
+    return {"path": paths, "label": labels}
+raw = convert_all()
+print(f" Conversion finished!\n Dataset size: {len(raw['path'])} samples")
+#  Step 2: Train/test split 
+dataset = Dataset.from_dict(raw).train_test_split(test_size=0.2, seed=42)
+print(f" Train size: {len(dataset['train'])}  Test size: {len(dataset['test'])}")
+#  Step 3: Feature extractor 
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(BASE_MODEL)
+#  Step 4: Preprocess function 
+def preprocess(batch):
+    audio, sr = torchaudio.load(batch["path"])
+    audio = audio.squeeze(0).numpy()
+    if sr != SAMPLE_RATE:
+        audio = torchaudio.functional.resample(torch.tensor(audio), sr, SAMPLE_RATE).numpy()
+    enc = feature_extractor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding=True)
+    batch["input_values"] = enc.input_values[0].numpy()
+    batch["attention_mask"] = (
+        enc.attention_mask[0].numpy() if "attention_mask" in enc else np.ones_like(enc.input_values[0].numpy())
+    )
+    return batch
+print("⚙️ Preprocessing WAV files ...")
+dataset = dataset.map(preprocess, num_proc=1)
+#  Step 5: Collator 
+def collate_fn(batch):
+    iv = [torch.tensor(b["input_values"]) for b in batch]
+    am = [torch.tensor(b["attention_mask"]) for b in batch]
+    y  = [b["label"] for b in batch]
+    iv = torch.nn.utils.rnn.pad_sequence(iv, batch_first=True)
+    am = torch.nn.utils.rnn.pad_sequence(am, batch_first=True)
+    return {"input_values": iv, "attention_mask": am, "labels": torch.tensor(y)}
+#  Step 6: Metrics 
+def compute_metrics(pred):
+    logits, labels = pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1": f1_score(labels, preds, average="weighted"),
+    }
+#  Step 7: Model 
+model = Wav2Vec2ForSequenceClassification.from_pretrained(
+    BASE_MODEL,
+    num_labels=len(LABELS),
+    label2id=label2id,
+    id2label=id2label,
+    problem_type="single_label_classification",
+)
+#  Step 8: Training args 
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=5,
+    learning_rate=1e-4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    fp16=True,
+    gradient_checkpointing=True,
+    save_steps=100,
+    save_total_limit=2,
+    logging_steps=10,
+    report_to="none",
+)
+#  Step 9: Trainer 
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
+    data_collator=collate_fn,
+    compute_metrics=compute_metrics,
+)
+print(" Starting training ...")
+trainer.train()
+#  Step 10: Save 
+final_dir = os.path.join(OUTPUT_DIR, "checkpoint-final")
+if os.path.exists(final_dir):
+    shutil.rmtree(final_dir)
+trainer.save_model(final_dir)
+feature_extractor.save_pretrained(final_dir)
+print(f" Final model + processor saved to {final_dir}")
+ 
